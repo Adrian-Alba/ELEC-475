@@ -1,94 +1,126 @@
 """
-ELEC 475: Lab 2 - Comprehensive Evaluation & Inspection Engine
-Evaluates trained checkpoint weights and reports Top-1 accuracy, Macro/Micro/Weighted F1,
-and full confusion matrix & classification report matching modern machine learning conference standards.
+ELEC 475: Lab 3 - Localization Evaluation Engine
+Evaluates the saved test-set predictions of SnoutNet, SnoutNet-A and SnoutNet-V
+against a mean-location baseline, and combines the three models into ensembles.
+
+Uses your functions in utils/metrics.py and utils/ensemble.py. Any function you
+have not implemented yet is skipped, so run this script after each In-Lab step.
+
+Post-Lab: once correct.py has saved corrected predictions, they are added to the
+tables and plots automatically.
 """
 import os
 import argparse
 import torch
-import torch.nn as nn
-from models import get_model
-from utils import get_dataloaders, AverageMeter, ConfusionMatrixTracker
+from utils.metrics import (euclidean_errors, baseline_predictions, ced_curve,
+                           best_worst_indices, print_results)
+from utils.ensemble import ensemble_mean, ensemble_median
+from utils.visualization import plot_ced, plot_best_worst
+
+MODEL_NAMES = {"snoutnet": "SnoutNet", "alexnet": "SnoutNet-A", "vgg16": "SnoutNet-V"}
+# Post-Lab: first-stage predictions that correct.py corrects, and the correction model checkpoints
+CORRECTED_MODELS = {"snoutnet": "SnoutNet", "vgg16": "SnoutNet-V", "ensemble_mean": "Ensemble (mean)"}
+CORRECTIONS = {"correction_noaug": "+ corr.", "correction_aug": "+ corr. (aug)",
+               "correction_mod_noaug": "+ mod. corr.", "correction_mod_aug": "+ mod. corr. (aug)"}
+
+_skipped = set()
 
 
-def evaluate_checkpoint(checkpoint_path: str, model_name: str, norm_type: str = "bn",
-                        dataset: str = "cifar10", data_dir: str = "./data", batch_size: int = 128):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("=" * 82)
-    print("ELEC 475: Model Checkpoint Multi-Metric Evaluation")
-    print(f"Loading checkpoint : {checkpoint_path}")
-    print(f"Model Architecture : {model_name.upper()} (Norm: {norm_type.upper() if model_name == 'alexnet' else 'N/A'})")
-    print(f"Dataset            : {dataset.upper()}")
-    print("=" * 82)
+def run(fn, *args):
+    """Calls fn, or returns None (with a one-time message) if it is not implemented yet."""
+    result = fn(*args)
+    if result is None and fn.__name__ not in _skipped:
+        print(f"[TODO] {fn.__name__}() is not implemented yet: skipped")
+        _skipped.add(fn.__name__)
+    return result
 
-    # 1. DataLoader
-    _, val_loader, num_classes, class_names = get_dataloaders(
-        dataset=dataset,
-        data_dir=data_dir,
-        batch_size=batch_size,
-        use_augmentation=False,
-        target_size=64
-    )
 
-    # 2. Model & Checkpoint Loading
-    model = get_model(model_name, num_classes=num_classes, in_channels=3, norm_type=norm_type)
-    if os.path.exists(checkpoint_path):
-        state_dict = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(state_dict)
-        print("Checkpoint weights loaded successfully.")
-    else:
-        print(f"Warning: Checkpoint '{checkpoint_path}' not found! Evaluating with uninitialized weights.")
+def load_predictions(pred_dir: str):
+    data = {}
+    for key in MODEL_NAMES:
+        path = os.path.join(pred_dir, f"{key}.pt")
+        if not os.path.exists(path):
+            raise SystemExit(f"Missing {path}: run  python predict.py --model all  first.")
+        data[key] = torch.load(path, weights_only=True)
+    names = data["snoutnet"]["names"]
+    assert all(d["names"] == names for d in data.values()), "Predictions files disagree on image order."
+    return data
 
-    model = model.to(device)
-    model.eval()
 
-    # 3. Evaluation Loop with Confusion Matrix & Multi-Metric Tracking
-    criterion = nn.CrossEntropyLoss()
-    loss_meter = AverageMeter("Loss")
-    tracker = ConfusionMatrixTracker(num_classes=num_classes, class_names=class_names)
+def evaluate_predictions(data_dir: str = "data/oxford-iiit-pet-noses", pred_dir: str = "predictions",
+                         plot_dir: str = "plots"):
+    img_dir = os.path.join(data_dir, "images-original", "images")
+    train_file = os.path.join(data_dir, "train_noses.txt")
 
-    with torch.no_grad():
-        for imgs, targets in val_loader:
-            imgs = imgs.to(device)
-            targets = targets.to(device)
+    print("=" * 72)
+    print("ELEC 475: Lab 3 Localization Evaluation")
+    print(f"Predictions   : {pred_dir}")
+    print("=" * 72)
 
-            outputs = model(imgs)
-            loss = criterion(outputs, targets)
+    # 1. Load Predictions
+    data = load_predictions(pred_dir)
+    gt = data["snoutnet"]["gt"]
+    orig_size = data["snoutnet"]["orig_size"]
 
-            loss_meter.update(loss.item(), imgs.size(0))
-            tracker.update(outputs, targets)
+    # 2. Errors of the Three Models (Step 3)
+    model_errors = {key: run(euclidean_errors, d["pred"], gt) for key, d in data.items()}
+    if any(e is None for e in model_errors.values()):
+        return  # every later step needs euclidean_errors()
 
-    # 4. Generate Classification Report & Metrics
-    metrics = tracker.compute_metrics()
+    rows = {}
+    baseline = run(baseline_predictions, orig_size, train_file, img_dir)
+    if baseline is not None:
+        rows["Baseline (mean)"] = dict(errors=euclidean_errors(baseline, gt), params=0, ms=0.0)
+    for key, d in data.items():
+        rows[MODEL_NAMES[key]] = dict(errors=model_errors[key], params=d["params"], ms=d["ms_per_image"])
 
-    print("\n" + "=" * 60)
-    print("Overall Evaluation Summary:")
-    print(f"  Test Loss            : {loss_meter.avg:.4f}")
-    print(f"  Top-1 Accuracy       : {metrics['top1_accuracy']:.2f}%")
-    print(f"  Macro F1-Score       : {metrics['macro_f1']:.2f}%")
-    print(f"  Micro F1-Score       : {metrics['micro_f1']:.2f}%")
-    print(f"  Weighted F1-Score    : {metrics['weighted_f1']:.2f}%")
-    print("=" * 60)
+    # 3. Ensembles (Step 6)
+    preds = [d["pred"] for d in data.values()]
+    total_params = sum(d["params"] for d in data.values())
+    total_ms = sum(d["ms_per_image"] for d in data.values())
+    for name, fn in [("Ensemble (mean)", ensemble_mean), ("Ensemble (median)", ensemble_median)]:
+        ens = run(fn, preds)
+        if ens is not None:
+            rows[name] = dict(errors=euclidean_errors(ens, gt), params=total_params, ms=total_ms)
 
-    print("\nDetailed Academic Classification Report:")
-    print(tracker.classification_report())
+    # 4. Corrected Predictions (Post-Lab), included once correct.py has saved them
+    corrected = {}
+    for key, base_name in CORRECTED_MODELS.items():
+        for tag, suffix in CORRECTIONS.items():
+            path = os.path.join(pred_dir, f"{key}_{tag}.pt")
+            if os.path.exists(path):
+                d = torch.load(path, weights_only=True)
+                name = f"{base_name} {suffix}"
+                corrected[name] = (f"{key}_{tag}", d)
+                rows[name] = dict(errors=euclidean_errors(d["pred"], gt), params=d["params"], ms=d["ms_per_image"])
+
+    # 5. Accuracy & Cost Tables (Steps 3 and 6)
+    print_results(rows)
+
+    # 6. Cumulative Error Distribution (Step 4)
+    curves = {name: run(ced_curve, row["errors"]) for name, row in rows.items()}
+    if all(c is not None for c in curves.values()):
+        plot_ced(curves, save_path=os.path.join(plot_dir, "ced.png"))
+
+    # 7. Best & Worst Predictions (Step 5, and Post-Lab corrected predictions)
+    figures = [(MODEL_NAMES[key], key, d) for key, d in data.items()]
+    figures += [(name, file_key, d) for name, (file_key, d) in corrected.items()]
+    for name, file_key, d in figures:
+        errors = rows[name]["errors"]
+        result = run(best_worst_indices, errors)
+        if result is not None:
+            best, worst = result
+            plot_best_worst(name, best, worst, errors, d, img_dir,
+                            save_path=os.path.join(plot_dir, f"best_worst_{file_key}.png"))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ELEC 475: Checkpoint Evaluation")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to .pth checkpoint file")
-    parser.add_argument("--model", type=str, default="lenet", choices=["lenet", "lenet_modern", "alexnet"])
-    parser.add_argument("--norm", type=str, default="bn", choices=["none", "lrn", "bn"])
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "tiny_imagenet"])
-    parser.add_argument("--data-dir", type=str, default="./data")
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser = argparse.ArgumentParser(description="ELEC 475: Lab 3 Localization Evaluation")
+    parser.add_argument("--data-dir", type=str, default="data/oxford-iiit-pet-noses",
+                        help="Directory where the dataset is stored")
+    parser.add_argument("--pred-dir", type=str, default="predictions",
+                        help="Directory containing the predictions files from predict.py")
+    parser.add_argument("--plot-dir", type=str, default="plots", help="Directory to save the plots")
     args = parser.parse_args()
 
-    evaluate_checkpoint(
-        checkpoint_path=args.checkpoint,
-        model_name=args.model,
-        norm_type=args.norm,
-        dataset=args.dataset,
-        data_dir=args.data_dir,
-        batch_size=args.batch_size
-    )
+    evaluate_predictions(data_dir=args.data_dir, pred_dir=args.pred_dir, plot_dir=args.plot_dir)
