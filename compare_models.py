@@ -7,7 +7,7 @@ Compares FLOPs, MACs, Parameters, Latency, and Throughput across:
   4. AlexNet-64 (Local Response Normalization - LRN)
   5. AlexNet-64 (Batch Normalization - BatchNorm2d)
   6. Torchvision AlexNet (PyTorch Model Zoo Reference Baseline)
-
+##CHANGES
 Academic Reference:
   He et al. (CVPR 2016), "Deep Residual Learning for Image Recognition";
   Howard et al. (2017), "MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications".
